@@ -68,7 +68,7 @@
 - **Aktualität der Statistiken**: Das flexible Datenmodell von CRM (EEWB-erweiterte Felder, generische Tabellen) kann den kostenbasierten Optimizer verwirren, wenn Statistiken nach Massendatenladungen (z. B. nach Middleware-Initialload oder Massendatenmigration) nicht aktualisiert werden.
 - **Sperren**: Das Statusmanagement und Änderungsbeleg-Framework von CRM kann zu **Sperrenkonflikten** bei gemeinsam genutzten Business-Objekten führen (z. B. Serviceaufträge, die von mehreren Bearbeitern bearbeitet werden), was die DB-Wartezeit erhöht und in der WebClient UI effektiv den gesamten Rollbereich/die Session blockiert, bis die Sperre aufgelöst ist.
 
-## 4. Serverseitiges Buffering ("HOF") im CRM-Kontext — Auswirkung auf die Laufzeit
+## 4. Serverseitiges Buffering im CRM-Kontext — Auswirkung auf die Laufzeit
 
 | Puffer-Ebene | Was wird gepuffert | Auswirkung auf die Laufzeit |
 |---|---|---|
@@ -79,7 +79,7 @@
 
 **Zentrale Erkenntnisse speziell für CRM:**
 
-1. In der **WebClient UI** ist der BOL/GENIL-Puffer der wirkungsvollste "HOF"-artige Puffer — er reduziert direkt Backend-/Datenbankzugriffe bei der Navigation zwischen Zuordnungsblöcken derselben Transaktion. Schlecht gepufferte oder häufig invalidierte BOL-Queries (z. B. durch benutzerdefinierte BAdIs, die das Buffering umgehen) sind eine sehr häufige Ursache für langsame Ladezeiten von Transaktionen.
+1. In der **WebClient UI** ist der BOL/GENIL-Puffer der wirkungsvollste serverseitige Puffer — er reduziert direkt Backend-/Datenbankzugriffe bei der Navigation zwischen Zuordnungsblöcken derselben Transaktion. Schlecht gepufferte oder häufig invalidierte BOL-Queries (z. B. durch benutzerdefinierte BAdIs, die das Buffering umgehen) sind eine sehr häufige Ursache für langsame Ladezeiten von Transaktionen.
 2. Da CRM-WebClient-Sessions deutlich mehr serverseitigen Zustand pro Nutzer tragen als typische UI5-/Fiori-Apps, sind die **Roll-in-/Roll-out-Kosten ein größerer Faktor** bei der CRM-WebClient-Performance als bei UI5-basierten CRM-Apps, die tendenziell zustandsloser sind und den Zustand in den Browser auslagern.
 3. Bei **UI5-/Fiori-basierten CRM-Erweiterungen** ist die Performance stärker OData-/Gateway-gebunden: Das darunterliegende DB- und BOL-Buffering gilt weiterhin (da Gateway-Services meist dieselbe BOL-Schicht aufrufen), sodass die Empfindlichkeit gegenüber dem DB-Zustand ebenso vorhanden ist — nur anders gemessen (Gateway-Trace statt ST03N-Dialogschritte).
 4. Unabhängig von der UI-Technologie bleibt ein ungesunder **Datenbankzustand** (veraltete Statistiken, Tabellenwachstum, Sperrenkonflikte) der dominierende Faktor für die gesamte CRM-Antwortzeit — Buffering mildert nur, *wie oft* die DB angesprochen wird, nicht *wie teuer* jeder Zugriff bei einem Cache-Miss ist.
