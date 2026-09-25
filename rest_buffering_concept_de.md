@@ -26,17 +26,29 @@ Dieses Dokument beschreibt ein überarbeitetes Pufferungskonzept für Daten, die
 
 ## Zentrale Zugriffsklasse
 
+Die Puffer-Fassade (`zcl_rest_buffer`) kennt keine HTTP-Details. Sie delegiert das eigentliche Abrufen der Daten bei einem Cache-Miss an eine **injizierte Provider-Instanz**, die das Interface `zif_rest_provider` implementiert. Dadurch bleibt die Pufferlogik vollständig unabhängig vom Transportmechanismus (REST, SOAP, RFC, etc.).
+
 ```abap
 CLASS zcl_rest_buffer DEFINITION.
   PUBLIC SECTION.
-    CLASS-METHODS get_data
+    METHODS constructor
+      IMPORTING io_provider TYPE REF TO zif_rest_provider.
+
+    METHODS get_data
       IMPORTING iv_key         TYPE string
                 iv_ttl_seconds TYPE i DEFAULT 300
       RETURNING VALUE(rv_data) TYPE string  " JSON-Payload
       RAISING   zcx_rest_error.
+
+  PRIVATE SECTION.
+    DATA mo_provider TYPE REF TO zif_rest_provider.
 ENDCLASS.
 
 CLASS zcl_rest_buffer IMPLEMENTATION.
+  METHOD constructor.
+    mo_provider = io_provider.
+  ENDMETHOD.
+
   METHOD get_data.
     " 1. Session-Puffer (Schicht 1) prüfen - bei Treffer & Gültigkeit sofort zurückgeben
     IF zcl_session_buffer=>is_valid( iv_key ).
@@ -52,11 +64,19 @@ CLASS zcl_rest_buffer IMPLEMENTATION.
       CATCH zcx_buffer_miss.
     ENDTRY.
 
-    " 3. Cache-Miss in beiden Schichten -> sperren, REST-API aufrufen, Write-Through
+    " 3. Cache-Miss in beiden Schichten -> sperren, Provider aufrufen, Write-Through
     CALL FUNCTION 'ENQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
     TRY.
-        rv_data = zcl_rest_client=>fetch( iv_key ).
-        zcl_persistent_buffer=>set( iv_key = iv_key iv_data = rv_data iv_ttl = iv_ttl_seconds ).
+        " Delegation an den injizierten Provider statt direktem HTTP-Aufruf
+        rv_data = mo_provider->fetch(
+          iv_key  = iv_key
+          iv_etag = zcl_persistent_buffer=>get_etag( iv_key ) ).
+
+        zcl_persistent_buffer=>set(
+          iv_key  = iv_key
+          iv_data = rv_data
+          iv_ttl  = iv_ttl_seconds
+          iv_etag = mo_provider->get_last_etag( ) ).
         zcl_session_buffer=>set( iv_key = iv_key iv_data = rv_data ).
       CLEANUP.
         CALL FUNCTION 'DEQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
@@ -65,6 +85,66 @@ CLASS zcl_rest_buffer IMPLEMENTATION.
   ENDMETHOD.
 ENDCLASS.
 ```
+
+## Provider-Klasse und Interaktion mit der Puffer-Fassade
+
+Die Provider-Klasse kapselt ausschließlich den Transport (HTTP/REST) und ist über ein schlankes Interface an die Puffer-Fassade angebunden. Dieses Zusammenspiel folgt dem **Dependency-Injection**-Prinzip: die Fassade kennt nur das Interface, nicht die konkrete Implementierung.
+
+```abap
+INTERFACE zif_rest_provider.
+  METHODS fetch
+    IMPORTING iv_key          TYPE string
+              iv_etag         TYPE string OPTIONAL
+    RETURNING VALUE(rv_data)  TYPE string
+    RAISING   zcx_rest_error.
+
+  METHODS get_last_etag
+    RETURNING VALUE(rv_etag) TYPE string.
+ENDINTERFACE.
+
+CLASS zcl_rest_provider DEFINITION.
+  PUBLIC SECTION.
+    INTERFACES zif_rest_provider.
+    METHODS constructor
+      IMPORTING iv_destination TYPE string.
+
+  PRIVATE SECTION.
+    DATA mv_destination TYPE string.
+    DATA mv_last_etag   TYPE string.
+    DATA mo_http_client  TYPE REF TO if_http_client.
+ENDCLASS.
+
+CLASS zcl_rest_provider IMPLEMENTATION.
+  METHOD constructor.
+    mv_destination = iv_destination.
+  ENDMETHOD.
+
+  METHOD zif_rest_provider~fetch.
+    " 1. HTTP-Client für die konfigurierte Destination aufbauen (z. B. via cl_http_client=>create_by_destination)
+    " 2. Falls iv_etag übergeben wurde, den Header 'If-None-Match' setzen -> Conditional GET
+    " 3. Request absenden und Antwort auswerten:
+    "    - 200 OK  -> Payload zurückgeben, neuen ETag aus Response-Header in mv_last_etag ablegen
+    "    - 304 Not Modified -> zcx_rest_error mit Kennzeichen "not_modified" auslösen,
+    "      damit die Fassade den bestehenden Puffereintrag lediglich verlängert (TTL-Refresh)
+    "    - 4xx/5xx -> zcx_rest_error auslösen, Fassade kann Negative-Caching anwenden
+  ENDMETHOD.
+
+  METHOD zif_rest_provider~get_last_etag.
+    rv_etag = mv_last_etag.
+  ENDMETHOD.
+ENDCLASS.
+```
+
+### Interaktionsablauf zwischen Fassade und Provider
+
+1. **Instanziierung / Injection**: Der Aufrufer (z. B. eine Business-Klasse) erzeugt `zcl_rest_buffer` und übergibt eine konkrete Provider-Instanz im Konstruktor (`NEW zcl_rest_buffer( io_provider = NEW zcl_rest_provider( 'Z_MY_DESTINATION' ) )`). Dadurch lässt sich der Provider pro Anwendungsfall austauschen (z. B. unterschiedliche Destinationen, Mock-Provider für Tests).
+2. **Nur bei Cache-Miss aktiv**: Der Provider wird ausschließlich dann angesprochen, wenn sowohl Session- als auch persistenter Puffer keinen gültigen Treffer liefern — die Fassade übernimmt die gesamte Entscheidungslogik, der Provider bleibt zustandslos bezüglich Caching.
+3. **ETag-Weitergabe**: Die Fassade liest einen ggf. vorhandenen ETag aus dem persistenten Puffer und reicht ihn als `iv_etag` an `fetch( )` weiter. Der Provider nutzt ihn für einen Conditional GET (`If-None-Match`-Header).
+4. **Antwortverarbeitung**: 
+   - Bei `200 OK` liefert der Provider den vollständigen Payload zurück; die Fassade schreibt ihn inklusive des neuen ETags (`get_last_etag( )`) in beide Pufferschichten (Write-Through).
+   - Bei `304 Not Modified` signalisiert der Provider dies über eine spezielle Exception; die Fassade verlängert lediglich die TTL des bestehenden Puffereintrags, ohne den Payload neu zu schreiben.
+   - Bei Fehlern (`4xx`/`5xx`) wirft der Provider `zcx_rest_error`; die Fassade kann daraufhin optional einen kurzlebigen Negative-Cache-Eintrag anlegen, um wiederholte Fehlanfragen an ein instabiles Remote-System zu vermeiden.
+5. **Austauschbarkeit für Tests**: Da die Fassade nur gegen `zif_rest_provider` programmiert, lässt sich in Unit-Tests problemlos ein Test-Double (`zcl_rest_provider_mock`) injizieren, das feste Antworten liefert — ohne echten HTTP-Aufruf.
 
 ## Persistente Puffertabelle: ZREST_BUFFER
 
@@ -105,10 +185,11 @@ Persistente Tabelle Treffer & gültig? ──Ja──► Session-Puffer befülle
 ENQUEUE-Sperre auf cache_key
       │
       ▼
-REST-API aufrufen (mit ETag, falls verfügbar)
+Provider->fetch() aufrufen (mit ETag, falls verfügbar)
       │
-      ▼
-Write-Through: Session-Puffer + Persistente Tabelle
+      ├── 200 OK           -> Write-Through: Session-Puffer + Persistente Tabelle (inkl. neuem ETag)
+      ├── 304 Not Modified -> nur TTL des bestehenden Puffereintrags verlängern
+      └── 4xx/5xx          -> optional Negative-Cache-Eintrag anlegen
       │
       ▼
 DEQUEUE, Daten zurückgeben
@@ -118,4 +199,4 @@ DEQUEUE, Daten zurückgeben
 
 - Das Design hinter einer Schnittstelle `ZIF_REST_BUFFER` kapseln, damit die Implementierung der persistenten Schicht (Z-Tabelle vs. HANA-gepufferte Tabelle vs. zukünftige Alternative) ausgetauscht werden kann, ohne den aufrufenden Code anzupassen.
 - Die Pufferungseinstellung der Tabelle ("Vollständig gepuffert" vs. "Generisch bereichsgepuffert") sollte anhand der Schlüsselkardinalität gewählt werden — generische Pufferung auf dem `CACHE_KEY`-Präfix funktioniert gut, wenn die Schlüssel strukturiert sind (z. B. `ENDPUNKT_PARAMHASH`).
-- Den eigentlichen HTTP-Aufruf (`cl_http_client` / `if_rest_client`) hinter einer Provider-Klasse kapseln, die in die Puffer-Fassade injiziert wird — so bleibt die Pufferungslogik vollständig von der Transportschicht entkoppelt.
+- Den eigentlichen HTTP-Aufruf (`cl_http_client` / `if_rest_client`) hinter einer Provider-Klasse kapseln, die über das Interface `zif_rest_provider` in die Puffer-Fassade injiziert wird — so bleibt die Pufferungslogik vollständig von der Transportschicht entkoppelt und der Provider pro Anwendungsfall (Destination, Mock für Tests) austauschbar.
