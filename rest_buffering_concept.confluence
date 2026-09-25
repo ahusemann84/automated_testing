@@ -1,0 +1,119 @@
+h1. REST Data Buffering Concept (ABAP) — 2-Layer Model
+
+h2. Overview
+
+This document describes a refined buffering concept for data retrieved from a remote system via REST API in an ABAP application. It extends the existing ABAP session buffer with a persistent, cross-user/cross-server layer, *without* relying on Shared Memory (CL_SHM_AREA).
+
+h2. Architecture
+
+{code}
++-----------------------------------------------+
+| Layer 1: Session Buffer (existing)             |  <- per user, in-memory, fastest
+|   - Singleton class, internal table/hashtable  |
++-----------------------------------------------+
+| Layer 2: Persistent Buffer (new)               |  <- cross-user, cross-server, survives restart
+|   - Custom Z-table with TTL / ETag             |
++-----------------------------------------------+
+| Layer 0: Remote REST API                       |  <- only hit on full cache miss
++-----------------------------------------------+
+{code}
+
+h2. Rationale for Dropping Shared Memory
+
+* Removes the need to manage {{CL_SHM_AREA}} versioning and area attach/detach lifecycle.
+* One less moving part to keep consistent across application servers (Shared Objects are local per app server anyway — they don't provide true cross-server sharing, so the Z-table already covers this use case better).
+* DB-buffered/persistent table access is fast enough for most REST-caching needs and provides durability across server restarts for free.
+
+h2. Core Access Class
+
+{code:title=ZCL_REST_BUFFER}
+CLASS zcl_rest_buffer DEFINITION.
+  PUBLIC SECTION.
+    CLASS-METHODS get_data
+      IMPORTING iv_key         TYPE string
+                iv_ttl_seconds TYPE i DEFAULT 300
+      RETURNING VALUE(rv_data) TYPE string  " JSON payload
+      RAISING   zcx_rest_error.
+ENDCLASS.
+
+CLASS zcl_rest_buffer IMPLEMENTATION.
+  METHOD get_data.
+    " 1. Check session buffer (Layer 1) - return immediately if hit & not expired
+    IF zcl_session_buffer=>is_valid( iv_key ).
+      rv_data = zcl_session_buffer=>get( iv_key ).
+      RETURN.
+    ENDIF.
+
+    " 2. Check persistent Z-table (Layer 2)
+    TRY.
+        rv_data = zcl_persistent_buffer=>get( iv_key ).
+        zcl_session_buffer=>set( iv_key = iv_key iv_data = rv_data ).
+        RETURN.
+      CATCH zcx_buffer_miss.
+    ENDTRY.
+
+    " 3. Cache miss both layers -> lock, call REST API, write-through
+    CALL FUNCTION 'ENQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
+    TRY.
+        rv_data = zcl_rest_client=>fetch( iv_key ).
+        zcl_persistent_buffer=>set( iv_key = iv_key iv_data = rv_data iv_ttl = iv_ttl_seconds ).
+        zcl_session_buffer=>set( iv_key = iv_key iv_data = rv_data ).
+      CLEANUP.
+        CALL FUNCTION 'DEQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
+    ENDTRY.
+    CALL FUNCTION 'DEQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
+  ENDMETHOD.
+ENDCLASS.
+{code}
+
+h2. Persistent Buffer Table: ZREST_BUFFER
+
+||Field||Type||Purpose||
+|CACHE_KEY|CHAR(100), key|Hash of endpoint + params|
+|PAYLOAD|STRING/RAWSTRING|Cached JSON response|
+|ETAG|CHAR(100)|For conditional GET (If-None-Match)|
+|CREATED_AT|TIMESTAMPL|Insert time|
+|VALID_UNTIL|TIMESTAMPL|TTL expiry|
+
+Enable *generic/single-record buffering* on this table (transaction SE13) so repeated reads for the same key hit the application server's table buffer instead of the database. This recovers most of the performance benefit that Shared Memory would have offered, without the SHM lifecycle complexity.
+
+h2. Key Design Decisions
+
+||Aspect||Recommendation||
+|TTL / invalidation|Store {{valid_until}} per entry; compare with {{utclong_current( )}}. Configurable per data category (master data = hours, prices = minutes).|
+|Cross-server consistency|Handled naturally by the Z-table (single source of truth in DB) + SAP table buffer invalidation broadcast — no custom sync logic needed.|
+|Cache invalidation trigger|Use ETag/Last-Modified when remote API supports it; store on {{ZREST_BUFFER-ETAG}}, send conditional requests, refresh TTL on 304 without re-parsing payload.|
+|Stampede protection|{{ENQUEUE}}/{{DEQUEUE}} on {{cache_key}} so concurrent misses don't trigger duplicate REST calls.|
+|Serialization|JSON string via {{/ui2/cl_json}}, keeping the buffer layer format-agnostic.|
+|Negative caching|Cache short-TTL "miss/error" markers to protect against hammering a failing remote system.|
+|Cleanup|Periodic background job (SM36) deleting expired rows from {{ZREST_BUFFER}}; keeps the table lean for buffering efficiency.|
+
+h2. Flow Diagram
+
+{code}
+Request for data
+      |
+      v
+Session Buffer hit & valid? --Yes--> return
+      | No
+      v
+Persistent table hit & valid? --Yes--> populate Session Buffer --> return
+      | No
+      v
+ENQUEUE lock on cache_key
+      |
+      v
+Call REST API (with ETag if available)
+      |
+      v
+Write-through: Session Buffer + Persistent table
+      |
+      v
+DEQUEUE, return data
+{code}
+
+h2. Implementation Notes
+
+* Keep the design behind a {{ZIF_REST_BUFFER}} interface so the persistent layer implementation (Z-table vs. HANA-buffered table vs. future alternative) can be swapped without touching calling code.
+* Table buffering setting ("Fully buffered" vs. "Generic area buffered") should be chosen based on key cardinality — generic buffering on the {{CACHE_KEY}} prefix works well if keys are structured (e.g., {{ENDPOINT_PARAMHASH}}).
+* Wrap the actual HTTP call ({{cl_http_client}} / {{if_rest_client}}) behind a provider class injected into the buffer facade, keeping buffering logic fully decoupled from the transport layer.
