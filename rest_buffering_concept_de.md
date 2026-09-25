@@ -1,202 +1,284 @@
-    # Konzept zur Pufferung von REST-Daten (ABAP) — 2-Schichten-Modell
+# REST-Pufferkonzept (ABAP, Deutsch) ohne Shared Objects
 
-## Übersicht
+## Zweck und Geltungsbereich
 
-Dieses Dokument beschreibt ein überarbeitetes Pufferungskonzept für Daten, die von einem Remote-System über eine REST-API in einer ABAP-Anwendung abgerufen werden. Es erweitert den bestehenden ABAP-Session-Puffer um eine persistente, nutzer-/serverübergreifende Schicht — *ohne* auf Shared Memory (`CL_SHM_AREA`) zurückzugreifen.
+Dieses Dokument beschreibt ein **konzeptionelles** 2-Schichten-Modell für REST-GET-Caching in ABAP:
 
-## Architektur
+1. bestehender Session-Cache (pro Session)
+2. persistente, **ungepufferte** Z-Tabelle (serverübergreifend über DB)
 
-```
-┌─────────────────────────────────────────────┐
-│ Schicht 1: Session-Puffer (bestehend)        │  ← pro Nutzer, im Speicher, am schnellsten
-│   - Singleton-Klasse, interne Tabelle/Hash   │
-├─────────────────────────────────────────────┤
-│ Schicht 2: Persistenter Puffer (neu)         │  ← nutzer-/serverübergreifend, überlebt Neustart
-│   - Custom Z-Tabelle mit TTL / ETag          │
-├─────────────────────────────────────────────┤
-│ Schicht 0: Remote-REST-API                   │  ← nur bei vollständigem Cache-Miss angesprochen
-└─────────────────────────────────────────────┘
-```
+Es wird **kein** application-managed Shared Memory / Shared Objects (`CL_SHM_AREA`) eingesetzt. Alle ABAP-Beispiele sind bewusst **Skeletons** (nicht direkt aktivierbar). Fehlende Typen, Interfaces, Klassen und Exceptions sind als vertragliche Bausteine zu implementieren.
 
-## Begründung für den Verzicht auf Shared Memory
+---
 
-- Entfällt die Notwendigkeit, den Lebenszyklus von `CL_SHM_AREA` (Versionierung, Area-Attach/Detach) zu verwalten.
-- Eine bewegliche Komponente weniger, die über mehrere Applikationsserver hinweg konsistent gehalten werden muss (Shared Objects sind ohnehin pro Applikationsserver lokal und bieten kein echtes serverübergreifendes Teilen — die Z-Tabelle deckt diesen Anwendungsfall bereits besser ab).
-- Der Zugriff auf eine gepufferte/persistente Tabelle ist für die meisten REST-Caching-Anforderungen schnell genug und bietet Persistenz über Serverneustarts hinweg kostenlos mit.
+## Architektur und Verantwortungen
 
-## Zentrale Zugriffsklasse
+### Schichten
 
-Die Puffer-Fassade (`zcl_rest_buffer`) kennt keine HTTP-Details. Sie delegiert das eigentliche Abrufen der Daten bei einem Cache-Miss an eine **injizierte Provider-Instanz**, die das Interface `zif_rest_provider` implementiert. Dadurch bleibt die Pufferlogik vollständig unabhängig vom Transportmechanismus (REST, SOAP, RFC, etc.).
-
-```abap
-CLASS zcl_rest_buffer DEFINITION.
-  PUBLIC SECTION.
-    METHODS constructor
-      IMPORTING io_provider TYPE REF TO zif_rest_provider.
-
-    METHODS get_data
-      IMPORTING iv_key         TYPE string
-                iv_ttl_seconds TYPE i DEFAULT 300
-      RETURNING VALUE(rv_data) TYPE string  " JSON-Payload
-      RAISING   zcx_rest_error.
-
-  PRIVATE SECTION.
-    DATA mo_provider TYPE REF TO zif_rest_provider.
-ENDCLASS.
-
-CLASS zcl_rest_buffer IMPLEMENTATION.
-  METHOD constructor.
-    mo_provider = io_provider.
-  ENDMETHOD.
-
-  METHOD get_data.
-    " 1. Session-Puffer (Schicht 1) prüfen - bei Treffer & Gültigkeit sofort zurückgeben
-    IF zcl_session_buffer=>is_valid( iv_key ).
-      rv_data = zcl_session_buffer=>get( iv_key ).
-      RETURN.
-    ENDIF.
-
-    " 2. Persistente Z-Tabelle (Schicht 2) prüfen
-    TRY.
-        rv_data = zcl_persistent_buffer=>get( iv_key ).
-        zcl_session_buffer=>set( iv_key = iv_key iv_data = rv_data ).
-        RETURN.
-      CATCH zcx_buffer_miss.
-    ENDTRY.
-
-    " 3. Cache-Miss in beiden Schichten -> sperren, Provider aufrufen, Write-Through
-    CALL FUNCTION 'ENQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
-    TRY.
-        " Delegation an den injizierten Provider statt direktem HTTP-Aufruf
-        rv_data = mo_provider->fetch(
-          iv_key  = iv_key
-          iv_etag = zcl_persistent_buffer=>get_etag( iv_key ) ).
-
-        zcl_persistent_buffer=>set(
-          iv_key  = iv_key
-          iv_data = rv_data
-          iv_ttl  = iv_ttl_seconds
-          iv_etag = mo_provider->get_last_etag( ) ).
-        zcl_session_buffer=>set( iv_key = iv_key iv_data = rv_data ).
-      CLEANUP.
-        CALL FUNCTION 'DEQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
-    ENDTRY.
-    CALL FUNCTION 'DEQUEUE_EZ_REST_BUFFER' EXPORTING cache_key = iv_key.
-  ENDMETHOD.
-ENDCLASS.
+```text
+┌──────────────────────────────────────────────────────────────┐
+│ Schicht 1: Session-Cache (bestehend)                         │
+│ - schnell, sessionlokal, darf begrenzt stale sein            │
+├──────────────────────────────────────────────────────────────┤
+│ Schicht 2: Persistenter Cache (neu/überarbeitet)             │
+│ - ungepufferte Z-Tabelle, Cache-Metadaten + Payload          │
+├──────────────────────────────────────────────────────────────┤
+│ Schicht 0: Remote REST API                                   │
+│ - nur bei Miss/Revalidierung                                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## Provider-Klasse und Interaktion mit der Puffer-Fassade
+### Kollaboratoren (Rollen)
 
-Die Provider-Klasse kapselt ausschließlich den Transport (HTTP/REST) und ist über ein schlankes Interface an die Puffer-Fassade angebunden. Dieses Zusammenspiel folgt dem **Dependency-Injection**-Prinzip: die Fassade kennt nur das Interface, nicht die konkrete Implementierung.
-
-```abap
-INTERFACE zif_rest_provider.
-  METHODS fetch
-    IMPORTING iv_key          TYPE string
-              iv_etag         TYPE string OPTIONAL
-    RETURNING VALUE(rv_data)  TYPE string
-    RAISING   zcx_rest_error.
-
-  METHODS get_last_etag
-    RETURNING VALUE(rv_etag) TYPE string.
-ENDINTERFACE.
-
-CLASS zcl_rest_provider DEFINITION.
-  PUBLIC SECTION.
-    INTERFACES zif_rest_provider.
-    METHODS constructor
-      IMPORTING iv_destination TYPE string.
-
-  PRIVATE SECTION.
-    DATA mv_destination TYPE string.
-    DATA mv_last_etag   TYPE string.
-    DATA mo_http_client  TYPE REF TO if_http_client.
-ENDCLASS.
-
-CLASS zcl_rest_provider IMPLEMENTATION.
-  METHOD constructor.
-    mv_destination = iv_destination.
-  ENDMETHOD.
-
-  METHOD zif_rest_provider~fetch.
-    " 1. HTTP-Client für die konfigurierte Destination aufbauen (z. B. via cl_http_client=>create_by_destination)
-    " 2. Falls iv_etag übergeben wurde, den Header 'If-None-Match' setzen -> Conditional GET
-    " 3. Request absenden und Antwort auswerten:
-    "    - 200 OK  -> Payload zurückgeben, neuen ETag aus Response-Header in mv_last_etag ablegen
-    "    - 304 Not Modified -> zcx_rest_error mit Kennzeichen "not_modified" auslösen,
-    "      damit die Fassade den bestehenden Puffereintrag lediglich verlängert (TTL-Refresh)
-    "    - 4xx/5xx -> zcx_rest_error auslösen, Fassade kann Negative-Caching anwenden
-  ENDMETHOD.
-
-  METHOD zif_rest_provider~get_last_etag.
-    rv_etag = mv_last_etag.
-  ENDMETHOD.
-ENDCLASS.
-```
-
-### Interaktionsablauf zwischen Fassade und Provider
-
-1. **Instanziierung / Injection**: Der Aufrufer (z. B. eine Business-Klasse) erzeugt `zcl_rest_buffer` und übergibt eine konkrete Provider-Instanz im Konstruktor (`NEW zcl_rest_buffer( io_provider = NEW zcl_rest_provider( 'Z_MY_DESTINATION' ) )`). Dadurch lässt sich der Provider pro Anwendungsfall austauschen (z. B. unterschiedliche Destinationen, Mock-Provider für Tests).
-2. **Nur bei Cache-Miss aktiv**: Der Provider wird ausschließlich dann angesprochen, wenn sowohl Session- als auch persistenter Puffer keinen gültigen Treffer liefern — die Fassade übernimmt die gesamte Entscheidungslogik, der Provider bleibt zustandslos bezüglich Caching.
-3. **ETag-Weitergabe**: Die Fassade liest einen ggf. vorhandenen ETag aus dem persistenten Puffer und reicht ihn als `iv_etag` an `fetch( )` weiter. Der Provider nutzt ihn für einen Conditional GET (`If-None-Match`-Header).
-4. **Antwortverarbeitung**: 
-   - Bei `200 OK` liefert der Provider den vollständigen Payload zurück; die Fassade schreibt ihn inklusive des neuen ETags (`get_last_etag( )`) in beide Pufferschichten (Write-Through).
-   - Bei `304 Not Modified` signalisiert der Provider dies über eine spezielle Exception; die Fassade verlängert lediglich die TTL des bestehenden Puffereintrags, ohne den Payload neu zu schreiben.
-   - Bei Fehlern (`4xx`/`5xx`) wirft der Provider `zcx_rest_error`; die Fassade kann daraufhin optional einen kurzlebigen Negative-Cache-Eintrag anlegen, um wiederholte Fehlanfragen an ein instabiles Remote-System zu vermeiden.
-5. **Austauschbarkeit für Tests**: Da die Fassade nur gegen `zif_rest_provider` programmiert, lässt sich in Unit-Tests problemlos ein Test-Double (`zcl_rest_provider_mock`) injizieren, das feste Antworten liefert — ohne echten HTTP-Aufruf.
-
-## Persistente Puffertabelle: ZREST_BUFFER
-
-| Feld | Typ | Zweck |
+| Baustein | Verantwortung | Darf nicht |
 |---|---|---|
-| `CACHE_KEY` | CHAR(100), Schlüssel | Hash aus Endpunkt + Parametern |
-| `PAYLOAD` | STRING/RAWSTRING | Gepufferte JSON-Antwort |
-| `ETAG` | CHAR(100) | Für Conditional GET (If-None-Match) |
-| `CREATED_AT` | TIMESTAMPL | Zeitpunkt des Einfügens |
-| `VALID_UNTIL` | TIMESTAMPL | Ablauf der TTL |
+| `zif_rest_provider` + Implementierung | HTTP-GET gegen Destination, Rückgabe strukturierter Antwort inkl. Header/Status/Zeitstempel | Kein Cachezugriff, kein `COMMIT WORK`/`ROLLBACK WORK`, kein mutable „last response“-State |
+| `zcl_rest_cache_facade` | Key-Building, Security-Scope-Prüfung, Session/Persistent-Lookup, Orchestrierung Refresh | Kein direkter Transportcode |
+| `zif_rest_refresh_unit` | Locking, Re-Read nach Lock, Provider-Aufruf, Cache-SQL, Commit/Rollback des **Cache-only**-Abschnitts | Keine Business-Änderungen |
+| `zif_rest_session_store` | Session-Lesen/Schreiben/Löschen | Kein Persistenzzugriff |
+| `zif_rest_persistent_store` | SQL für persistenten Cache (ungepufferte Tabelle) | Kein HTTP |
+| `zif_rest_key_builder` | deterministische Schlüsselbildung inkl. Scope/Varianten | Keine Credentials/Tokens im Key |
+| `zif_rest_policy` | Cachebarkeit/Freshness/Retention/`Vary`/`no-store` usw. | Keine Transaktionssteuerung |
 
-Aktivieren Sie *generische Pufferung/Einzelsatzpufferung* für diese Tabelle (Transaktion SE13), damit wiederholte Lesezugriffe auf denselben Schlüssel den Tabellenpuffer des Applikationsservers statt der Datenbank treffen. Dies gewinnt den Großteil des Performancevorteils zurück, den Shared Memory geboten hätte — ohne dessen Lebenszyklus-Komplexität.
+---
 
-## Zentrale Designentscheidungen
+## Provider-Vertrag (zustandslos)
 
-| Aspekt | Empfehlung |
-|---|---|
-| **TTL / Invalidierung** | `valid_until` pro Eintrag speichern; Vergleich mit `utclong_current( )`. Konfigurierbar je Datenkategorie (Stammdaten = Stunden, Preise = Minuten). |
-| **Serverübergreifende Konsistenz** | Wird durch die Z-Tabelle (Single Source of Truth in der DB) + SAP-Tabellenpuffer-Invalidierungs-Broadcast auf natürliche Weise sichergestellt — keine eigene Synchronisationslogik nötig. |
-| **Auslöser für Cache-Invalidierung** | ETag/Last-Modified nutzen, sofern die Remote-API dies unterstützt; in `ZREST_BUFFER-ETAG` speichern, Conditional Requests senden, TTL bei 304 ohne erneutes Parsen des Payloads auffrischen. |
-| **Schutz vor Cache-Stampede** | `ENQUEUE`/`DEQUEUE` auf `cache_key`, damit gleichzeitige Cache-Misses nicht mehrfach denselben REST-Aufruf auslösen. |
-| **Serialisierung** | JSON-String über `/ui2/cl_json`, damit die Pufferschicht formatunabhängig bleibt. |
-| **Negative-Caching** | Kurzlebige "Miss/Error"-Marker puffern, um ein fehlerhaftes/langsames Remote-System vor wiederholten Anfragen zu schützen. |
-| **Bereinigung** | Regelmäßiger Hintergrundjob (SM36), der abgelaufene Zeilen aus `ZREST_BUFFER` löscht; hält die Tabelle schlank für effiziente Pufferung. |
+> **Konzept-Skeleton**: nicht aktivierungsfertig.
 
-## Ablaufdiagramm
+```abap
+INTERFACE zif_rest_provider PUBLIC.
+  TYPES: BEGIN OF ty_request_descriptor,
+           destination_id         TYPE string,
+           sap_client             TYPE mandt,
+           resource_path          TYPE string,
+           normalized_query       TYPE string,
+           accept_language        TYPE sylangu,
+           trusted_security_scope TYPE string,
+         END OF ty_request_descriptor.
 
+  TYPES: BEGIN OF ty_validator,
+           etag          TYPE string,
+           last_modified TYPE string,
+         END OF ty_validator.
+
+  TYPES: BEGIN OF ty_header,
+           name  TYPE string,
+           value TYPE string,
+         END OF ty_header,
+         ty_headers TYPE STANDARD TABLE OF ty_header WITH EMPTY KEY.
+
+  TYPES: BEGIN OF ty_response,
+           http_status           TYPE i,
+           payload_x             TYPE xstring,
+           headers               TYPE ty_headers, "Duplikate bleiben erhalten
+           sent_at_utc           TYPE utclong,
+           received_at_utc       TYPE utclong,
+         END OF ty_response.
+
+  METHODS fetch_get
+    IMPORTING
+      is_request     TYPE ty_request_descriptor
+      is_validator   TYPE ty_validator OPTIONAL
+    RETURNING
+      VALUE(rs_resp) TYPE ty_response
+    RAISING
+      zcx_rest_transport_failure
+      zcx_rest_protocol_failure.
+ENDINTERFACE.
 ```
-Anfrage nach Daten
-      │
-      ▼
-Session-Puffer Treffer & gültig? ──Ja──► zurückgeben
-      │ Nein
-      ▼
-Persistente Tabelle Treffer & gültig? ──Ja──► Session-Puffer befüllen ──► zurückgeben
-      │ Nein
-      ▼
-ENQUEUE-Sperre auf cache_key
-      │
-      ▼
-Provider->fetch() aufrufen (mit ETag, falls verfügbar)
-      │
-      ├── 200 OK           -> Write-Through: Session-Puffer + Persistente Tabelle (inkl. neuem ETag)
-      ├── 304 Not Modified -> nur TTL des bestehenden Puffereintrags verlängern
-      └── 4xx/5xx          -> optional Negative-Cache-Eintrag anlegen
-      │
-      ▼
-DEQUEUE, Daten zurückgeben
+
+### Regeln für den Provider
+
+- Führt nur HTTP-GET aus; Credentials kommen aus der Destination.
+- Kein Zugriff auf Session-/Persistent-Cache.
+- Keine transaktionalen Statements (`COMMIT WORK`, `ROLLBACK WORK`) und keine Update-Task-Registrierung.
+- Kein `get_last_etag`, kein `mv_last_etag`.
+- HTTP-Status wie `304`, `404`, `429`, `503` werden **normal** im Ergebnis geliefert.
+- Exception nur bei Transport-/Protokollfehlern ohne verwertbare Antwort.
+- Request-Descriptor enthält echte Request-Dimensionen; ein Cache-Hash allein ist unzulässig.
+
+---
+
+## Fassade und Schlüsselisolation
+
+Die Fassade erhält ihre Abhängigkeiten per Injection:
+
+- Session-Store
+- Persistent-Store
+- Key-Builder
+- Policy
+- Refresh-Unit
+- optional Clock/Lock-Adapter
+
+Cache-Key trennt mindestens:
+
+- Destination
+- SAP-Client
+- Resource + normalisierte Query
+- Repräsentation/Sprache
+- Autorisierungs-/Security-Scope
+
+**Nie** Teil des Keys: Credentials, Access-Tokens, Secret-Material.
+
+Session-Lesepfad:
+
+1. Session-Read
+2. Persistent-Read
+3. Refresh
+
+Ein `found`-Flag unterscheidet „kein Eintrag“ von „gültiger leerer Payload“. Promotion von persistent nach Session übernimmt **absolute Expiry** und Metadaten unverändert (kein TTL-Neustart). Vor Session-Neuschreiben nach Refresh wird ein alter Session-Eintrag des Callers entfernt; Schreiben nur wenn `session_allowed = abap_true`.
+
+---
+
+## Datenvertrag für Cache-Einträge und Refresh-Ergebnis
+
+> **Konzept-Skeleton**: unterstützende Typen/Enums/Exceptions sind zu definieren.
+
+```abap
+TYPES: BEGIN OF ty_cache_entry,
+         cache_key                 TYPE string,
+         found                     TYPE abap_bool,
+         payload_x                 TYPE xstring,
+         etag                      TYPE string,
+         last_modified             TYPE string,
+         http_status               TYPE i,
+         cache_control_raw         TYPE string,
+         vary_raw                  TYPE string,
+         validated_at_utc          TYPE utclong,
+         fresh_until_utc           TYPE utclong,
+         retain_until_utc          TYPE utclong,
+         representation_version    TYPE string,
+       END OF ty_cache_entry.
+
+TYPES: BEGIN OF ty_refresh_result,
+         entry               TYPE ty_cache_entry,
+         session_allowed     TYPE abap_bool,
+         persistent_allowed  TYPE abap_bool,
+       END OF ty_refresh_result.
 ```
 
-## Implementierungshinweise
+Semantik:
 
-- Das Design hinter einer Schnittstelle `ZIF_REST_BUFFER` kapseln, damit die Implementierung der persistenten Schicht (Z-Tabelle vs. HANA-gepufferte Tabelle vs. zukünftige Alternative) ausgetauscht werden kann, ohne den aufrufenden Code anzupassen.
-- Die Pufferungseinstellung der Tabelle ("Vollständig gepuffert" vs. "Generisch bereichsgepuffert") sollte anhand der Schlüsselkardinalität gewählt werden — generische Pufferung auf dem `CACHE_KEY`-Präfix funktioniert gut, wenn die Schlüssel strukturiert sind (z. B. `ENDPUNKT_PARAMHASH`).
-- Den eigentlichen HTTP-Aufruf (`cl_http_client` / `if_rest_client`) hinter einer Provider-Klasse kapseln, die über das Interface `zif_rest_provider` in die Puffer-Fassade injiziert wird — so bleibt die Pufferungslogik vollständig von der Transportschicht entkoppelt und der Provider pro Anwendungsfall (Destination, Mock für Tests) austauschbar.
+- `200`: Payload + Validatoren + Metadaten werden vollständig ersetzt; fehlende frühere Validatoren werden gelöscht.
+- `304`: normaler Ergebnisfall, Payload bleibt erhalten, Metadaten/Freshness werden neu berechnet.
+- `304` ohne vorhandene Payload: genau **ein** Retry ohne Validatoren; zweite unbrauchbare `304` => Protokollfehler.
+- `retain_until_utc` ist von Freshness getrennt (Revalidation mit abgelaufener Repräsentation möglich).
+- ETags werden nicht gekürzt.
+
+---
+
+## Refresh-Algorithmus und Transaktionsgrenzen
+
+### Wichtige Leitplanken
+
+- Refresh läuft als **Cache-only Application Phase vor Business-Änderungen**.
+- Facade und Provider committen/rollbacken **nie** Business-Transaktionen.
+- Die Refresh-Unit besitzt Lock + Cache-SQL + `COMMIT WORK`/`ROLLBACK WORK` für den Cache-Teil.
+- Methoden-/RFC-Aufruf ist **keine** automatische Transaktionsisolation.
+- Implizite Commit-Grenzen sind zu berücksichtigen.
+- Cache-Miss in beliebigen laufenden Business-LUWs ist im Initialmodell **nicht unterstützt**.
+
+### Ablauf (vereinfacht)
+
+```text
+Client
+  -> Facade: get(Descriptor, CallerContext)
+  -> Facade: Scope validieren
+  -> SessionStore: read
+  -> PersistentStore: read
+  -> RefreshUnit: refresh_if_needed
+      -> LockAdapter: acquire_exclusive(key, timeout)
+      -> PersistentStore: reread_unbuffered(key)
+      -> [falls jetzt wiederverwendbar] return
+      -> Provider: fetch_get(Descriptor, optional validator)
+      -> [200] neues Entry bauen
+      -> [304+payload] Payload behalten, Metadaten mergen
+      -> [304 ohne payload] genau 1x ohne Validator retry
+      -> [andere Status] zcx_rest_http_status_failure
+      -> PersistentStore: stage upsert/delete gemäß Policy
+      -> COMMIT WORK (nur Cache-Teil)
+      -> LockAdapter: release
+  -> Facade: Session publizieren falls erlaubt
+  -> return
+```
+
+### Lock-/Fehlerregeln
+
+- Exklusive Sperre pro Key mit begrenzter Wartezeit und explizitem Fehler (`zcx_rest_lock_timeout` o.ä.).
+- Lock wird bei **allen** Ausgängen freigegeben (Erfolg, Transport-/HTTP-/Protokoll-/Store-Fehler).
+- Lock-Ownership muss Commit/Rollback überleben; Scope explizit festlegen.
+- Release-Fehler dürfen Originalfehler nicht maskieren; Release-Fehler werden separat geloggt.
+
+### Transaktions-Phasen-Tabelle
+
+| Phase | Erlaubt | Nicht erlaubt |
+|---|---|---|
+| Vor Refresh (Cache-only) | Reads, Locking vorbereiten | Business-Daten ändern |
+| HTTP-Phase | Provider-Aufruf, Status/Metadaten auswerten | Cache-SQL starten |
+| Cache-SQL-Phase | direkte synchrone SQL-Operationen (Upsert/Delete) | Update-Task-basiertes Schreiben |
+| Abschluss | `COMMIT WORK`/`ROLLBACK WORK` der Cache-Änderungen, dann Unlock | Business-COMMIT/ROLLBACK beeinflussen |
+
+---
+
+## HTTP-Caching-Policy (Initialmodell)
+
+- `no-store`: weder Session noch persistent speichern; konservativ vorhandenen passenden Eintrag entfernen.
+- `private`: keine cross-user Persistenz-Publikation.
+- `no-cache`: vor Wiederverwendung revalidieren.
+- `Vary`: relevante Request-Header-Werte in Key aufnehmen oder konservativ Caching ablehnen.
+- Keine pauschale Negative-Caching-Strategie im Initialmodell.
+- Auth-/Server-Fehler nicht als normale Daten cachen.
+- Initial fokussiert auf erfolgreiche GET-Caching-Pfade; Retry/Backoff separat und begrenzt spezifizieren.
+
+---
+
+## Konsistenz- und Staleness-Aussagen
+
+- Persistenter Store startet **ungepuffert** (keine blanket DDIC-Buffering-Empfehlung).
+- Es gibt **keine** Aussage über sofortige serverweite Invalidation.
+- Session-Kopien dürfen innerhalb expliziter Grenzen stale bleiben.
+- Falls sofortige Invalidation nötig ist: separates Versions-/Invalidierungsverfahren als Folgearbeit definieren.
+- Keine generische Pufferung per Hash-Substring als Standardannahme.
+
+---
+
+## Test-Checkliste (fachlich)
+
+- [ ] Session-Hit ruft Provider nicht auf
+- [ ] Persistent-Hit ruft Provider nicht auf
+- [ ] Re-Read nach Lock verhindert Doppel-Refresh
+- [ ] `200` ersetzt Payload/Validatoren vollständig
+- [ ] `304` behält Payload und aktualisiert Metadaten/Freshness
+- [ ] `304` ohne Payload triggert genau einen unbedingten Retry
+- [ ] `no-store` speichert in keiner Schicht
+- [ ] Transport-/HTTP-/Protokoll-/Store-Fehler geben Lock frei
+- [ ] Store-Fehler nach SQL-Start führt zu Rollback + Propagation
+- [ ] Promotion Session<-Persistent erhält absolute Expiry
+- [ ] Isolation nach Destination/Client/Security-Scope
+- [ ] Refresh vor Business-Änderungen (Cache-only-Phase)
+- [ ] Explizit begrenzte Staleness über Sessions dokumentiert
+
+### Observability (kurz)
+
+- Metriken: Layer-Hit-Rate, Refresh-Dauer, Lock-Wartezeit, Fehlerraten nach Kategorie.
+- Betriebsgrenzen: Retention-Cleanup, maximale Cachegröße, maximale Payloadgröße.
+
+---
+
+## Offene plattformspezifische Punkte
+
+1. Konkrete ABAP-Release-Verfügbarkeit der verwendeten Zeitstempel-APIs/Typen (`utclong` etc.) prüfen.
+2. Lock-Scope/Owner so festlegen, dass expliziter Commit/Rollback im Cache-Teil den Lock nicht ungewollt freigibt.
+3. Falls später „valid response without cache write“ als Fallback gewünscht ist: unklare Commit-/Invalidierungssemantik explizit modellieren.
+
+---
+
+## Referenzen (primäre Quellen)
+
+> Hinweis: Externe Seiten waren in dieser Laufumgebung nicht live abrufbar; URLs sind als maßgebliche Primärquellen angegeben.
+
+1. RFC 9111 – *HTTP Caching*: https://www.rfc-editor.org/rfc/rfc9111.html
+2. SAP ABAP Keyword Documentation – `COMMIT WORK`: https://help.sap.com/doc/abapdocu_latest_index_htm/latest/en-US/ABAPCOMMIT.html
+3. SAP ABAP Keyword Documentation – `ROLLBACK WORK`: https://help.sap.com/doc/abapdocu_latest_index_htm/latest/en-US/ABAPROLLBACK.html
+4. SAP ABAP Keyword Documentation – SAP Locks / ENQUEUE-Konzept: https://help.sap.com/doc/abapdocu_latest_index_htm/latest/en-US/ABENSAP_LOCK.html
