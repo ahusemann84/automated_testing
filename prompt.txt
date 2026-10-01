@@ -1,0 +1,73 @@
+Create an implementation plan for the ABAP persistent REST buffer described
+in rest_buffering_concept_de.md. Do not implement code or modify files.
+
+Treat this document as the authoritative planning baseline. Consult
+rest_buffering_concept.confluence for context only; explicitly identify
+conflicts rather than combining incompatible recommendations.
+
+Scope
+Implement the existing persistent-buffer concept without redesigning it.
+The only additional planning requirement is concrete integration with the
+existing session buffer. Reuse that buffer; do not introduce a replacement
+or a parallel session cache.
+
+Begin by inspecting the available implementation
+- Locate the existing session buffer, its public API, callers, key format,
+  payload types, expiry handling, invalidation, and session lifecycle.
+- Locate the REST provider and relevant business transaction boundaries.
+- Distinguish verified implementation details from conceptual class names.
+  If source code is unavailable, list the exact artifacts needed and mark
+  the affected integration steps as provisional. Do not invent existing APIs.
+
+Plan the integration
+- Preserve existing caller-facing behavior and signatures where possible.
+  Identify any unavoidable changes explicitly.
+- Describe the minimal adapter or extension needed to connect the existing
+  session buffer to the concept's facade/session-store contract.
+- Use the lookup order: valid session entry -> reusable persistent entry ->
+  coordinated REST refresh.
+- Apply compatible cache keys, authorization scope, freshness rules, and
+  metadata across both layers. Distinguish a miss from a valid empty payload.
+- Promote persistent entries into the session buffer without restarting TTL:
+  preserve absolute expiry and policy-relevant metadata.
+- After refresh, remove the caller's old session entry and repopulate only
+  when policy permits. Explain no-store removal in both layers and bounded
+  staleness of copies in other sessions.
+- Identify any existing direct session-buffer access that would bypass these
+  rules and include the necessary integration changes.
+
+Preserve the concept's constraints
+- Unbuffered persistent Z-table; no Shared Objects/CL_SHM_AREA.
+- Stateless, injected HTTP provider; separate transport, storage, policy,
+  key-building, and refresh responsibilities.
+- Keys isolate destination, SAP client, resource/query, representation,
+  language, and trusted security scope; never include credentials or tokens.
+- Per-key locking with bounded wait, unbuffered re-read after acquiring the
+  lock, and release on every exit path.
+- Cache-only refresh phase before business changes. Do not treat a method
+  or RFC call as automatic transaction isolation or commit business data.
+  Flag incompatible existing call sites as blockers needing a decision.
+- Correct 200 replacement and 304 revalidation; exactly one unconditional
+  retry for a 304 without a stored representation.
+- Respect no-store, private, no-cache, and Vary. No generic negative caching,
+  silent persistence-error fallback, or immediate cross-session invalidation.
+- Separate freshness from retention; preserve full validators.
+
+Output
+1. Brief assessment of the concept, document conflicts, and implementation
+   evidence available.
+2. Concrete mapping from existing session-buffer behavior to the required
+   integration changes.
+3. Dependency-ordered implementation steps covering DDIC/storage, contracts,
+   refresh/locking/transactions, session integration, and operations.
+   For each step, identify affected existing or proposed artifacts,
+   dependencies, and measurable acceptance criteria.
+4. Tests covering both cache-hit paths without HTTP, unchanged expiry during
+   promotion, concurrent misses, 200/304 behavior, policy enforcement,
+   scope isolation, stale-session replacement, valid empty payloads, lock
+   cleanup, rollback/error propagation, and existing caller compatibility.
+5. Rollout considerations and unresolved decisions, including ABAP release
+   compatibility and lock ownership across commit/rollback.
+
+Keep the plan limited to the documented concept plus existing-session-buffer
+integration. Separate blockers from follow-up work; do not add new features.
