@@ -1,3 +1,68 @@
+Worktree ready~/Produktentwicklung/copilot-worktrees/…/ahusemann84-crispy-happiness
+
+Copilot session started
+
+
+
+## You said: Check the existing concept for persistent buffer and provide a prompt the creates an implmentation plan. Only thing to add…
+
+Check the existing concept for persistent buffer and provide a prompt the creates an implmentation plan. Only thing to add to this plan would be the existing session buffer that should integrate the pesistent buffer
+
+
+
+
+
+
+
+12m ago
+
+
+
+
+
+
+
+### Inspect repository status and root files and 5 other tool calls
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Copilot said: The concept already includes **the existing session buffer as Layer 1**, with the persistent buffer underneath it. The missing detail…
+
+The concept already includes **the existing session buffer as Layer 1**, with the persistent buffer underneath it. The missing detail is how to integrate the actual session-buffer implementation without replacing it or breaking its callers.
+
+
+Use `rest_buffering_concept_de.md` as the planning baseline. The Confluence version conflicts with it on table buffering, negative caching, and consistency guarantees. This repository contains concept documents, not the session-buffer implementation, so its integration points still need to be identified.
+
+
+**Copy-ready prompt:**
+
+
+Plain text
+
+
+
+
+
+
+```
 Create an implementation plan for the ABAP persistent REST buffer described
 in rest_buffering_concept_de.md. Do not implement code or modify files.
 
@@ -71,3 +136,410 @@ Output
 
 Keep the plan limited to the documented concept plus existing-session-buffer
 integration. Separate blockers from follow-up work; do not add new features.
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## You said: Integrate all information needed directly into the prompt, do o reference further documents from the repository
+
+Integrate all information needed directly into the prompt, do o reference further documents from the repository
+
+
+
+
+
+
+
+1m ago
+
+
+
+
+
+
+
+## Copilot said: ```text Create a concrete implementation plan for a persistent REST GET buffer in an ABAP application, using the self-contained concept…
+
+Plain text
+
+
+
+
+
+
+```
+Create a concrete implementation plan for a persistent REST GET buffer in an ABAP application, using the self-contained concept below. Do not implement code or modify files. Do not require additional concept documents.
+
+The only addition to this concept is detailed integration with the existing session buffer. Reuse that implementation rather than replacing it or introducing a parallel session cache. Avoid unrelated features or architectural redesign.
+
+## 1. Goal and architecture
+
+Introduce persistent REST GET caching beneath the application's existing session buffer:
+
+1. Existing session buffer: fast, session-local storage.
+2. Persistent buffer: an unbuffered custom Z-table shared through the database across application servers and authorized callers.
+3. Remote REST API: accessed only when no reusable cached representation exists or revalidation is required.
+
+Do not use application-managed Shared Memory or Shared Objects
+(CL_SHM_AREA). Do not enable DDIC table buffering in the initial model.
+
+Persistence does not imply immediate invalidation of copies already held in
+other sessions. Session copies may remain stale within explicitly defined
+limits. Immediate cross-session invalidation is separate follow-up work.
+
+The concept is not activation-ready ABAP. Names below describe intended
+contracts, not verified existing application objects.
+
+## 2. Inspect the existing implementation first
+
+Identify:
+- The existing session-buffer implementation, public API, callers, lifecycle,
+  key format, payload types, expiry rules, and invalidation behavior.
+- Existing REST transport/provider code and how destinations supply credentials.
+- Business transaction boundaries around buffer access.
+- Existing helpers for serialization, hashing, timestamps, locking, logging,
+  dependency injection, and tests.
+
+Reuse suitable existing components and conventions.
+
+If implementation source is unavailable, do not invent APIs or claim that
+integration points have been verified. List the exact classes, interfaces,
+call sites, and platform details needed. Mark affected plan steps as
+provisional, while completing all planning supported by this concept.
+
+## 3. Responsibilities and contracts
+
+Use these conceptual roles, adapting names to existing application conventions:
+
+- zcl_rest_cache_facade:
+  Validates security scope, builds keys, coordinates session/persistent
+  lookups and refresh, and publishes eligible results to the session buffer.
+  Contains no direct HTTP transport code and does not commit or roll back.
+
+- zif_rest_session_store:
+  Reads, writes, and removes entries in the EXISTING session buffer.
+  Has no persistence access. Prefer a minimal adapter or compatible extension.
+
+- zif_rest_persistent_store:
+  Performs SQL reads and staged writes/deletes against the unbuffered
+  persistent cache table. Contains no HTTP code or transaction ownership.
+
+- zif_rest_key_builder:
+  Builds deterministic, isolated cache keys without credentials or tokens.
+
+- zif_rest_policy:
+  Determines cache eligibility, freshness, retention, and HTTP directive
+  handling. Contains no transaction control.
+
+- zif_rest_provider:
+  Stateless HTTP GET provider using credentials from the destination.
+  Has no cache access, COMMIT WORK, ROLLBACK WORK, or update-task registration.
+  Does not expose mutable "last response" state or last-ETag getters.
+
+- zif_rest_refresh_unit:
+  Owns per-key locking, the post-lock persistent re-read, provider invocation,
+  response interpretation, cache-only SQL, and cache-only commit/rollback.
+  Performs no business-data changes.
+
+Inject collaborators into the facade. Use clock and lock adapters where
+needed for deterministic tests and platform isolation.
+
+### Provider request
+
+Include real request dimensions, not only a cache hash:
+- Destination identifier.
+- SAP client.
+- Resource path.
+- Normalized query.
+- Representation/language and relevant request-header values.
+- Trusted authorization/security scope.
+
+Optional validators:
+- ETag.
+- Last-Modified.
+
+### Provider response
+
+Return a structured result containing:
+- HTTP status.
+- Payload as XSTRING.
+- Response headers as a collection preserving duplicate header fields.
+- Request-sent and response-received UTC timestamps.
+
+Return HTTP statuses such as 304, 404, 429, and 503 normally in this result.
+Raise transport/protocol exceptions only when no usable HTTP response exists.
+The orchestration layer, not the provider, decides cache and error behavior.
+
+## 4. Keys and security isolation
+
+Cache identity must distinguish at least:
+- Destination.
+- SAP client.
+- Resource path and normalized query.
+- Representation and language.
+- Trusted authorization/security scope.
+- Relevant request-header values required by supported Vary behavior.
+
+Validate scope before any cache lookup. Cross-user reuse is allowed only
+within a proven compatible authorization scope.
+
+Never place credentials, access tokens, or secret material in cache keys.
+Do not assume that hashing a key fixes missing isolation dimensions.
+Do not assume that query normalization may change request semantics.
+
+Use compatible identity rules across both layers. Account for legacy
+session-buffer keys that may not contain all required dimensions.
+
+## 5. Cache-entry and refresh-result model
+
+The logical cache-entry contract includes:
+- cache_key
+- found
+- payload_x
+- etag
+- last_modified
+- http_status
+- cache_control_raw
+- vary_raw
+- validated_at_utc
+- fresh_until_utc
+- retain_until_utc
+- representation_version
+
+Additional policy-relevant metadata must be retained where required for
+correct HTTP freshness and revalidation.
+
+The found flag distinguishes a missing entry from a valid empty payload.
+It is lookup-result state and need not be a persisted database column.
+
+The refresh result includes:
+- entry
+- session_allowed
+- persistent_allowed
+
+Define concrete DDIC-compatible storage types and key layout during planning.
+Do not blindly use fixed-length validator fields that truncate ETags.
+Choose timestamp APIs/types supported by the target ABAP release.
+
+Freshness and retention are different:
+- fresh_until_utc determines whether reuse without revalidation is permitted.
+- retain_until_utc determines how long an expired representation may remain
+  available for revalidation before cleanup.
+
+## 6. Required session-buffer integration
+
+Preserve existing caller-facing signatures and intended behavior wherever
+possible. Identify unavoidable changes and their affected callers explicitly.
+
+Plan the smallest adapter or extension that enables the existing buffer to
+retain the required identity, payload, absolute expiry, and policy metadata.
+Do not create a second session cache.
+
+Read path:
+1. Validate scope and derive the cache identity.
+2. Read the existing session buffer; return only if policy permits reuse.
+3. Read the persistent buffer; return/promote only if policy permits reuse.
+4. Otherwise invoke coordinated refresh.
+
+A found entry is not automatically reusable: freshness, no-cache, scope,
+and representation rules still apply.
+
+Promotion from persistent storage to the session buffer must preserve
+absolute expiry and relevant metadata. Never restart TTL during promotion.
+
+After refresh:
+- Remove the caller's previous session entry before any replacement.
+- Repopulate only when session_allowed is true.
+- Do not publish results prematurely if required persistent work has failed.
+- Return a successfully retrieved non-cacheable response without storing it
+  when policy prohibits storage; this is not a persistence-error fallback.
+
+For no-store, remove matching existing entries in the caller's session and
+persistent storage according to the coordinated policy/transaction flow.
+Do not claim to clear copies in all other sessions immediately.
+
+Find direct session-buffer access paths that could bypass the new key,
+freshness, scope, or policy rules and include necessary caller integration.
+
+Document the permitted staleness window across sessions and how existing
+session reset/invalidation behavior remains compatible.
+
+## 7. Refresh algorithm and HTTP behavior
+
+For a required refresh:
+1. Acquire an exclusive per-key lock with bounded waiting.
+2. Re-read persistent storage unbuffered after acquiring the lock.
+3. If another caller has already produced a reusable entry, return that
+   result without another HTTP request.
+4. Otherwise call the provider using retained validators when appropriate.
+5. Interpret the response and evaluate policy.
+6. Stage the necessary persistent upsert/delete.
+7. Commit the cache-only changes.
+8. Release the lock.
+9. Let the facade update the caller's session buffer if permitted.
+
+Response rules:
+- 200: Replace payload, validators, and response metadata completely.
+  Clear previous validators when absent from the new response.
+- 304 with a stored representation: Preserve its payload, merge applicable
+  metadata, and recompute freshness.
+- 304 without a stored representation: Retry exactly once without validators.
+  A second unusable 304 is a protocol error.
+- A valid zero-length stored representation still counts as present.
+- Other HTTP statuses: Raise an explicit HTTP-status failure in the initial
+  model rather than treating error bodies as normal cached application data.
+
+Do not silently serve stale data on refresh failure unless a separately
+approved policy is introduced. Generic retries/backoff beyond the specified
+304 recovery are not part of this initial implementation.
+
+## 8. HTTP cache policy
+
+Implement explicit handling of:
+- no-store: Store in neither layer; conservatively remove matching old entries.
+- private: No cross-user persistent publication.
+- no-cache: Revalidate before reuse.
+- Vary: Incorporate supported relevant request-header values into identity,
+  or conservatively decline caching when safe matching is unsupported.
+
+Make session_allowed and persistent_allowed decisions explicit.
+Do not assume that every successful response is eligible for both layers.
+
+Focus on successful GET caching. Do not introduce generic negative caching
+or cache authorization/server failures as normal data.
+
+Specify standards-consistent freshness calculation, including relevant
+response timing/header metadata and any application TTL defaults or caps.
+Where endpoint policy is unknown, identify a decision rather than inventing
+a duration.
+
+## 9. Transaction boundaries
+
+Refresh is supported only in a cache-only application phase before business
+changes have begun.
+
+- The refresh unit owns COMMIT WORK/ROLLBACK WORK for cache-only changes.
+- The facade and provider never commit or roll back business transactions.
+- A method or RFC call does not automatically provide transaction isolation.
+- Account for implicit commit boundaries on the target ABAP platform.
+- Cache misses during arbitrary active business LUWs are not supported by
+  the initial model.
+
+Required phase ordering:
+1. Before refresh: reads and lock preparation; no business changes.
+2. HTTP phase: fetch and evaluate response; do not begin cache writes.
+3. Cache-SQL phase: direct synchronous upsert/delete; no update-task writes.
+4. Completion: commit/rollback cache changes, then unlock.
+
+Inspect existing callers for compatibility with this constraint. If they
+can miss or require revalidation after business changes begin, flag the
+integration as blocked pending a supported call-order/phase decision.
+Do not hide the issue with an assumed isolated method or RFC wrapper.
+
+## 10. Locking and failure handling
+
+- Use an exclusive SAP enqueue lock per full cache identity.
+- Define bounded wait and an explicit lock-timeout error.
+- Explicitly choose lock scope/ownership so required ownership survives
+  cache commit/rollback until deliberate release.
+- Release acquired locks on every exit path, including successful post-lock
+  reuse, transport, HTTP, protocol, and storage failures.
+- If an error occurs after cache SQL starts, roll back the cache-only
+  transaction and propagate the failure.
+- A release failure must not mask an original failure; log it separately.
+- Do not add silent failures or success-shaped fallbacks for storage errors.
+
+Define concrete exception contracts using existing application conventions.
+Conceptual categories include transport, protocol, HTTP status, lock timeout,
+and persistent-store failure.
+
+Returning a fetched response despite a failed required cache write is not
+part of this model; its commit/invalidation semantics would need separate
+design and approval.
+
+## 11. Operations and consistency
+
+Plan:
+- Retention-based cleanup that does not delete expired-but-retained
+  representations merely because freshness has elapsed.
+- Explicit maximum cache size and payload-size limits.
+- Layer hit-rate metrics, refresh duration, lock-wait duration, and error
+  counts by category.
+- Compatibility with existing session lifecycle and invalidation.
+- Safe rollout and rollback within the existing application/deployment model.
+
+Do not promise instantaneous server-wide invalidation.
+Do not add generic hash-prefix table buffering, Shared Objects, a new
+distributed invalidation service, or other out-of-scope infrastructure.
+
+## 12. Required verification
+
+Include measurable acceptance criteria and tests for:
+- A reusable session hit performs no provider call or persistent read.
+- A reusable persistent hit performs no provider call and populates the
+  existing session buffer.
+- Promotion preserves absolute expiry; repeated promotion cannot extend TTL.
+- A valid empty payload is distinguishable from a miss.
+- Expired/no-cache session entries cannot bypass required revalidation.
+- Concurrent misses are resolved by lock plus post-lock re-read without
+  duplicate refreshes while the new entry remains reusable.
+- 200 fully replaces payload/metadata and clears obsolete validators.
+- 304 preserves payload and updates metadata/freshness correctly.
+- 304 without a representation triggers exactly one unconditional retry.
+- no-store leaves neither a caller-session copy nor a matching persistent copy.
+- private, no-cache, and supported/unsupported Vary behavior.
+- Destination, client, representation, and security-scope isolation in both layers.
+- Caller-session replacement/removal after refresh and policy changes.
+- Lock timeout, release on all acquired-lock exit paths, and preservation of
+  original errors when release also fails.
+- Cache-SQL failures cause rollback and error propagation without session
+  publication of an unsuccessful refresh.
+- Refresh is scheduled before business changes and does not commit business data.
+- Existing session-buffer callers and lifecycle behavior remain compatible.
+- Retention cleanup, payload/size limits, and explicitly bounded session staleness.
+
+## 13. Required plan output
+
+Produce:
+1. A concise assessment of the proposed design, available implementation
+   evidence, and material integration risks.
+2. A mapping of existing session-buffer behavior to the minimal required
+   changes, distinguishing verified details from assumptions.
+3. Dependency-ordered implementation steps covering contracts, DDIC/storage,
+   key/policy logic, provider adaptation, refresh/locking/transactions,
+   existing-session-buffer integration, and operations.
+4. For each step: affected existing or proposed artifacts, concrete work,
+   prerequisites, measurable acceptance criteria, and relevant tests.
+5. A caller/data-flow description showing lookup, promotion, refresh,
+   transaction boundaries, and session publication.
+6. Rollout/rollback considerations and unresolved decisions, especially
+   ABAP release compatibility, session-buffer metadata support, trusted
+   security scope, freshness/staleness limits, and lock ownership.
+
+Keep the plan actionable and limited to this concept plus integration with
+the existing session buffer. Separate blocking decisions from optional
+future work. Do not generate implementation code.
+
+```
